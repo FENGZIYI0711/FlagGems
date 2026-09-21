@@ -34,6 +34,9 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.topk import _MAX_INT32_VAL, _MIN_INT32_VAL, argsort
+from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
+from flag_gems.utils import triton_lang_extension as tle
 
 # CHUNKED_MERGE_MIN_K / RADIX_MIN_N / RADIX_MAX_ROWS are runtime routing knobs:
 # the benchmark harness overrides them via environment variables for A/B
@@ -48,9 +51,6 @@ CHUNK_MAX_K = 2048
 # Chosen so per-program candidate blocks stay within the probed tl.sort
 # width limit (2048) on this backend's triton.
 CHUNK_SIZE = 1024
-from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
-from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
@@ -376,13 +376,12 @@ HIST_BINS = 65536  # full u16 key domain, one bin per key
 
 
 @triton.jit
-def _fp8_row_col_key(x_ptr, scale_ptr, row, cols, m, N: tl.constexpr,
-                     GROUP_SIZE: tl.constexpr):
+def _fp8_row_col_key(
+    x_ptr, scale_ptr, row, cols, m, N: tl.constexpr, GROUP_SIZE: tl.constexpr
+):
     # Monotone u16 key of the dequantized A16 value at (row, cols); the
     # bit-level recipe matches the chunked path exactly.
-    bits = tl.load(x_ptr + row.to(tl.int64) * N + cols, mask=m, other=0).to(
-        tl.uint8
-    )
+    bits = tl.load(x_ptr + row.to(tl.int64) * N + cols, mask=m, other=0).to(tl.uint8)
     q = _fp8_e5_to_f32(bits)
     s = tl.load(
         scale_ptr + row.to(tl.int64) * tl.cdiv(N, GROUP_SIZE) + cols // GROUP_SIZE,
@@ -710,28 +709,53 @@ def _launch_radix_topk(
     # k. Pass 3: shared decode kernel.
     block_n = 1024
     n_tiles = triton.cdiv(n, block_n)
-    hist = torch.zeros(
-        (batch_size, HIST_BINS), device=x_2d.device, dtype=torch.int32
-    )
+    hist = torch.zeros((batch_size, HIST_BINS), device=x_2d.device, dtype=torch.int32)
     thr = torch.empty((batch_size,), device=x_2d.device, dtype=torch.int16)
     ctr = torch.zeros((batch_size,), device=x_2d.device, dtype=torch.int32)
     # EQ-pass overflow leaves tail slots unwritten; zeros keep them pads.
     cand = torch.zeros((batch_size, k), device=x_2d.device, dtype=torch.int32)
     with torch_device_fn.device(x_2d.device):
         topk_fp8_radix_hist_kernel[(batch_size, n_tiles)](
-            hist, x_2d, scale_2d, n, group_size, block_n, HIST_BINS,
-            num_warps=4, num_stages=1,
+            hist,
+            x_2d,
+            scale_2d,
+            n,
+            group_size,
+            block_n,
+            HIST_BINS,
+            num_warps=4,
+            num_stages=1,
         )
         topk_fp8_radix_thr16_kernel[(batch_size,)](
             hist, thr, k, HIST_BINS, 8192, num_warps=8, num_stages=1
         )
         topk_fp8_radix_collect_kernel[(batch_size, n_tiles)](
-            cand, ctr, x_2d, scale_2d, thr, k, n, group_size, block_n, False,
-            num_warps=4, num_stages=1,
+            cand,
+            ctr,
+            x_2d,
+            scale_2d,
+            thr,
+            k,
+            n,
+            group_size,
+            block_n,
+            False,
+            num_warps=4,
+            num_stages=1,
         )
         topk_fp8_radix_collect_kernel[(batch_size, n_tiles)](
-            cand, ctr, x_2d, scale_2d, thr, k, n, group_size, block_n, True,
-            num_warps=4, num_stages=1,
+            cand,
+            ctr,
+            x_2d,
+            scale_2d,
+            thr,
+            k,
+            n,
+            group_size,
+            block_n,
+            True,
+            num_warps=4,
+            num_stages=1,
         )
         topk_fp8_chunk_decode_kernel[(batch_size,)](
             y_vals_2d,
