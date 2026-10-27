@@ -157,3 +157,50 @@ def test_bmm_w8a8_einsum_shapes(shape, dtype, monkeypatch):
     ).transpose(0, 1)
     assert actual.shape == (b, h, d)
     torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.01)
+
+
+@pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX graph fast paths")
+@pytest.mark.bmm_w8a8
+@pytest.mark.parametrize("m", [1, 4, 16, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.float8_e5m2])
+def test_bmm_w8a8_einsum_graph_full_range(m, dtype):
+    torch.manual_seed(20261027)
+    n, k = 1024, 4096
+    device = flag_gems.device
+    if dtype == torch.int8:
+        codes = torch.arange(-128, 128, dtype=torch.int16).to(torch.int8)
+    else:
+        codes = torch.arange(256, dtype=torch.int16).to(torch.uint8)
+        codes = codes[torch.isfinite(codes.view(dtype).float())]
+    codes = codes.to(device)
+
+    def sample(shape):
+        return codes[torch.randint(codes.numel(), shape, device=device)].view(dtype)
+
+    a = sample((1, m, k))
+    b = sample((1, n, k)).transpose(1, 2)
+    scale_limit = 1e-6 if dtype == torch.float8_e5m2 else 1e-3
+    sa = torch.rand(1, m, device=device) * scale_limit
+    sb = torch.rand(1, n, device=device) * scale_limit
+    out = torch.empty((1, m, n), device=device, dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            actual = flag_gems.bmm_w8a8(a, b, sa, sb, out=out)
+    assert actual is out
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        flag_gems.bmm_w8a8(a, b, sa, sb, out=out)
+    for _ in range(2):
+        a.copy_(sample(a.shape))
+        b.copy_(sample((1, n, k)).transpose(1, 2))
+        sa.uniform_(0, scale_limit)
+        sb.uniform_(0, scale_limit)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = (
+            torch.bmm(a.double(), b.double()) * sa[:, :, None] * sb[:, None, :]
+        ).bfloat16()
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=0.01)

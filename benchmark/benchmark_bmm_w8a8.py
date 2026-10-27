@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flag_gems import bmm_w8a8
+from flag_gems import bmm_w8a8, vendor_name
 
 
 def capture(fn):
@@ -43,6 +43,13 @@ def measure(gs):
 
 
 def main():
+    if vendor_name == "metax" and not bmm_w8a8.__module__.endswith(
+        "_metax.ops.bmm_w8a8"
+    ):
+        raise RuntimeError(
+            "MetaX bmm_w8a8 was not registered; refusing to benchmark the generic fallback"
+        )
+    print(f"Implementation: {bmm_w8a8.__module__}", flush=True)
     torch.manual_seed(20261019)
     torch.backends.cuda.matmul.allow_tf32 = False
     rows = []
@@ -122,6 +129,7 @@ def main():
             rows.append(
                 dict(
                     dtype=str(dt),
+                    implementation=bmm_w8a8.__module__,
                     shape=[bs, m, n, k],
                     batch_assumed=shape_source == "bmm_w8a8_fp8__int8",
                     shape_source=shape_source,
