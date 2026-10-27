@@ -18,6 +18,12 @@ import flag_gems
 )
 @pytest.mark.parametrize("transpose", [False, True])
 def test_bmm_w8a8(dtype, out_dtype, shape, transpose):
+    if (
+        dtype == torch.float8_e4m3fn
+        and flag_gems.vendor_name == "nvidia"
+        and torch.cuda.get_device_capability() < (8, 9)
+    ):
+        pytest.skip("Triton FP8 E4M3FN conversion requires NVIDIA SM89 or newer")
     torch.manual_seed(20261019)
     batch, m, n, k = shape
     device = flag_gems.device
