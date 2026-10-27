@@ -17,6 +17,7 @@ import flag_gems
     ],
 )
 @pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.bmm_w8a8
 def test_bmm_w8a8(dtype, out_dtype, shape, transpose):
     if (
         dtype == torch.float8_e4m3fn
@@ -62,6 +63,7 @@ def test_bmm_w8a8(dtype, out_dtype, shape, transpose):
         (1, 163, 2112, 1024),
     ],
 )
+@pytest.mark.bmm_w8a8
 def test_bmm_w8a8_aligned(shape):
     torch.manual_seed(20261020)
     batch, m, n, k = shape
@@ -81,6 +83,7 @@ def test_bmm_w8a8_aligned(shape):
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX graph fast path")
+@pytest.mark.bmm_w8a8
 def test_bmm_w8a8_graph_replay():
     torch.manual_seed(20261020)
     a = torch.randint(
