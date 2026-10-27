@@ -161,7 +161,7 @@ def test_bmm_w8a8_einsum_shapes(shape, dtype, monkeypatch):
 
 @pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX graph fast paths")
 @pytest.mark.bmm_w8a8
-@pytest.mark.parametrize("m", [1, 4, 16, 64, 128, 256, 512])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.float8_e5m2])
 def test_bmm_w8a8_einsum_graph_full_range(m, dtype):
     torch.manual_seed(20261027)

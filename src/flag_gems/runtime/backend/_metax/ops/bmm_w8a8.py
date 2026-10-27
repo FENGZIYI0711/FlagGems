@@ -109,6 +109,17 @@ class NativeBlas:
         )
 
 
+@triton.jit
+def e4m3_to_float32(value):
+    bits = value.to(tl.int32)
+    magnitude = bits & 127
+    normal = (magnitude << 20) + (120 << 23)
+    subnormal = (magnitude.to(tl.float32) * 0.001953125).to(tl.int32, bitcast=True)
+    payload = tl.where(magnitude < 8, subnormal, normal)
+    payload = tl.where(magnitude == 127, 0x7FC00000, payload)
+    return (((bits & 128) << 24) | payload).to(tl.float32, bitcast=True)
+
+
 @libentry()
 @triton.jit
 def vector_kernel(
@@ -122,6 +133,7 @@ def vector_kernel(
     K: tl.constexpr,
     C: tl.constexpr,
     INTEGER: tl.constexpr,
+    E4M3: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     cols = tl.program_id(1) * C + tl.arange(0, C)
@@ -130,6 +142,8 @@ def vector_kernel(
     b = tl.load(
         B + cols[:, None] * K + reduction[None, :], cols[:, None] < N, other=0.0
     )
+    if E4M3:
+        a, b = e4m3_to_float32(a), e4m3_to_float32(b)
     if INTEGER:
         value = tl.sum(a[None, :].to(tl.int32) * b.to(tl.int32), 1).to(tl.float32)
     else:
@@ -228,10 +242,41 @@ def c550_einsum(A, B, A_scale, B_scale, out):
     _, m, k = A.shape
     n = B.shape[2]
     integer = A.dtype == torch.int8
-    if (integer and m <= 4) or (not integer and m == 1):
-        cols = 2 if m == 1 else 4
+    if integer and m > 2:
+        operator = native_gemm()
+        if operator is not None:
+            operator(
+                [m, n, k],
+                A,
+                B,
+                out,
+                A_scale.view(1, m, 1),
+                B_scale.view(1, 1, n),
+                None,
+            )
+            return out
+    e4m3 = A.dtype == torch.float8_e4m3fn
+    if (
+        (integer and m <= 4)
+        or (e4m3 and m <= 2)
+        or (A.dtype == torch.float8_e5m2 and m <= 8)
+    ):
+        cols = 2 if m == 1 or e4m3 else 4
+        vector_a = A.view(torch.uint8) if e4m3 else A
+        vector_b = B.view(torch.uint8) if e4m3 else B
         vector_kernel[(m, triton.cdiv(n, cols))](
-            A, B, A_scale, B_scale, out, m, n, k, cols, integer, num_warps=4
+            vector_a,
+            vector_b,
+            A_scale,
+            B_scale,
+            out,
+            m,
+            n,
+            k,
+            cols,
+            integer,
+            e4m3,
+            num_warps=4,
         )
         return out
     if integer:
