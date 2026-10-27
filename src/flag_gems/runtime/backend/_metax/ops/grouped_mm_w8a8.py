@@ -26,18 +26,140 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.ops.scaled_grouped_mm import (
-    _check_dims,
-    _decode_e4m3,
-    _normalize_bias,
-    _normalize_scale,
-    _resolve_shapes,
-)
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 _E4M3_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+BIAS_NONE = 0
+BIAS_VECTOR = 1
+BIAS_GROUPED = 2
+
+
+@triton.jit
+def _decode_e4m3(bits, FNUZ: tl.constexpr):
+    # Load FP8 storage as bytes: several backends cannot represent FP8 pointers.
+    bits = bits.to(tl.int32)
+    exponent = (bits >> 3) & 15
+    mantissa = bits & 7
+    if FNUZ:
+        power = ((exponent + 119) << 23).to(tl.float32, bitcast=True)
+        subnormal = mantissa.to(tl.float32) * 0.0009765625
+        is_nan = bits == 128
+    else:
+        power = ((exponent + 120) << 23).to(tl.float32, bitcast=True)
+        subnormal = mantissa.to(tl.float32) * 0.001953125
+        is_nan = (bits & 127) == 127
+    value = tl.where(exponent == 0, subnormal, power * (1.0 + mantissa * 0.125))
+    value = tl.where((bits & 128) != 0, -value, value)
+    return tl.where(is_nan, float("nan"), value).to(tl.float16)
+
+
+def _check_dims(mat_a, mat_b):
+    if mat_a.dim() not in (2, 3):
+        raise RuntimeError("mat_a has to be 2D or 3D")
+    if mat_b.dim() not in (2, 3):
+        raise RuntimeError("mat_b has to be 2D or 3D")
+    if mat_a.dtype != mat_b.dtype:
+        raise RuntimeError(
+            f"mat_a and mat_b must have the same dtype, got {mat_a.dtype} and {mat_b.dtype}"
+        )
+
+
+def _check_offsets(offs, need_offsets, num_groups):
+    if need_offsets:
+        if offs is None:
+            raise RuntimeError("offs must be provided when either input is 2D")
+        if offs.dim() != 1:
+            raise RuntimeError("offs has to be 1D")
+        if offs.dtype != torch.int32:
+            raise RuntimeError("offs has to be int32")
+        if offs.numel() != num_groups:
+            raise RuntimeError(
+                f"offs length must match the group count, got {offs.numel()} and {num_groups}"
+            )
+        return offs.contiguous()
+
+    if offs is not None:
+        raise RuntimeError("offs must be None when both inputs are 3D")
+    return None
+
+
+def _resolve_shapes(mat_a, mat_b, offs):
+    a_is_2d = mat_a.dim() == 2
+    b_is_2d = mat_b.dim() == 2
+    need_offsets = a_is_2d or b_is_2d
+
+    if a_is_2d:
+        M, K = mat_a.shape
+    else:
+        num_groups_a, M, K = mat_a.shape
+
+    if b_is_2d:
+        BK, N = mat_b.shape
+    else:
+        num_groups_b, BK, N = mat_b.shape
+
+    if K != BK:
+        raise RuntimeError(
+            f"mat_a and mat_b shapes cannot be multiplied ({K} and {BK})"
+        )
+
+    if need_offsets:
+        if a_is_2d and b_is_2d:
+            num_groups = offs.numel() if offs is not None else 0
+            out_shape = (num_groups, M, N)
+        elif a_is_2d:
+            num_groups = num_groups_b
+            out_shape = (M, N)
+        else:
+            num_groups = num_groups_a
+            out_shape = (M, N)
+    else:
+        if num_groups_a != num_groups_b:
+            raise RuntimeError(
+                f"matrix batch sizes have to match, got {num_groups_a} and {num_groups_b}"
+            )
+        num_groups = num_groups_a
+        out_shape = (num_groups, M, N)
+
+    offs = _check_offsets(offs, need_offsets, num_groups)
+    return a_is_2d, b_is_2d, num_groups, M, N, K, out_shape, offs
+
+
+def _normalize_scale(scale, mat, *, dim, num_groups, scale_multiplier, name):
+    if scale.dtype != torch.float32:
+        raise RuntimeError(f"{name} must be a float32 tensor")
+
+    if mat.dim() == 2:
+        expected = mat.shape[dim] * scale_multiplier
+        if scale.dim() != 1 or scale.numel() != expected:
+            raise RuntimeError(f"{name} must be a 1D tensor with length {expected}")
+        return scale.reshape(expected).contiguous()
+
+    expected_shape = (num_groups, mat.shape[1 + dim])
+    if scale.dim() != 2 or tuple(scale.shape) != expected_shape:
+        raise RuntimeError(f"{name} must have shape {expected_shape}")
+    return scale.contiguous()
+
+
+def _normalize_bias(bias, *, a_is_2d, b_is_2d, num_groups, N):
+    if bias is None:
+        return None, BIAS_NONE
+
+    if bias.dim() == 1 and bias.numel() == N:
+        return bias.contiguous(), BIAS_VECTOR
+
+    can_use_grouped_bias = not (b_is_2d and not a_is_2d)
+    if can_use_grouped_bias and bias.numel() == num_groups * N:
+        return bias.reshape(num_groups, N).contiguous(), BIAS_GROUPED
+
+    expected = f"({N},)"
+    if can_use_grouped_bias:
+        expected = f"{expected} or ({num_groups}, {N})"
+    raise RuntimeError(f"bias must have shape {expected}")
 
 
 def _use_sparse_int8(M, N, K, groups):
@@ -54,6 +176,9 @@ def _select_config(M, N, K, num_groups, mode, is_int8):
         # Packed M alone overestimates the useful tile height for small experts.
         if mode == 0 and M <= 16 * num_groups and N >= 64 and K >= 128:
             return (16, 64, 128, 4)
+        # Long-K projections reuse operands across a larger reduction tile.
+        if mode == 0 and M >= 4096 and 256 <= N <= 512 and K >= 2048:
+            return (128, 128, 128, 8)
         # Larger expert groups can amortize wider tiles and their shared memory.
         if mode == 0 and N == 256 and K >= 512 and M >= 256 * num_groups:
             return (256, 128, 64, 8)
@@ -411,27 +536,29 @@ def _grouped_mm_quantized(
             bm, bn, bk, warps = (64, 64, 64, 4)
         elif (bm, bn) == (128, 256):
             bm, bn, bk, warps = (128, 128, 64, 4)
+        elif (bm, bn, bk, warps) == (128, 128, 128, 8):
+            bm, bn, bk, warps = (128, 128, 64, 4)
     # Direct expert mapping avoids prefix work for small average group sizes;
     # its inner M loop also handles skewed partitions with larger individual groups.
     stages = 2 if is_int8 else 1
     if is_int8 and mode == 0 and _use_sparse_int8(M, N, K, groups):
         stages = 1
     compact_groups = active_groups is not None
-    direct_group = mode == 0 and M <= 64 * groups
+    long_k_tiles = is_int8 and mode == 0 and (bm, bn, bk, warps) == (128, 128, 128, 8)
+    direct_group = mode == 0 and M <= 64 * groups and not long_k_tiles
     if mode == 0:
         grid = (triton.cdiv(M, bm) + groups - 1, triton.cdiv(N, bn))
     elif mode == 1:
         grid = (triton.cdiv(N, bn) + groups - 1, triton.cdiv(M, bm))
     else:
         grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn), groups)
-    # A wider N makes group-local traversal worthwhile; narrower GEMMs retain
-    # the original tile order with the tuned four-warp tile configuration.
+    # Keep neighboring CTAs on one expert to reuse long-K operands in cache.
     group_major = (
         not direct_group
         and is_int8
         and mode == 0
         and M >= 4096
-        and N >= 1024
+        and (N >= 1024 or long_k_tiles)
         and K >= 512
     )
     if group_major:
