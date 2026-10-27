@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -113,3 +116,44 @@ def test_bmm_w8a8_graph_replay():
             torch.bmm(a.double(), b.double()) * sa[:, :, None] * sb[:, None, :]
         ).bfloat16()
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=0.01)
+
+
+# FlagOSTune f4f65a7d779a0df3b017e9a80b75a7b9d651c639, DeepSeek-V4-Flash.
+# Reuse contraction dimensions, with channel-wise rather than block-wise scales.
+EINSUM_SHAPES = [
+    tuple(row["shape"])
+    for row in json.loads(
+        (Path(__file__).parent / "data/bmm_w8a8_einsum_shapes.json").read_text()
+    )
+]
+
+
+@pytest.mark.bmm_w8a8
+@pytest.mark.parametrize("shape", EINSUM_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.float8_e5m2])
+def test_bmm_w8a8_einsum_shapes(shape, dtype, monkeypatch):
+    if (
+        dtype == torch.float8_e4m3fn
+        and flag_gems.vendor_name == "nvidia"
+        and torch.cuda.get_device_capability() < (8, 9)
+    ):
+        pytest.skip("Triton FP8 E4M3FN conversion requires NVIDIA SM89 or newer")
+    torch.manual_seed(20261027)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    b, h, d, r = shape
+    device = flag_gems.device
+    # bhr,hdr->bhd becomes (h,b,r) @ (h,r,d), followed by a view transpose.
+    x = (torch.randn(b, h, r, device=device) * 3).to(dtype)
+    y = (torch.randn(h, d, r, device=device) * 3).to(dtype)
+    xs = torch.rand(b, h, device=device) * 0.01
+    ys = torch.rand(h, d, device=device) * 0.01
+    expected = (
+        torch.einsum("bhr,hdr->bhd", x.float(), y.float())
+        * xs[:, :, None]
+        * ys[None, :, :]
+    ).bfloat16()
+    actual = flag_gems.bmm_w8a8(
+        x.permute(1, 0, 2), y.transpose(1, 2), xs.transpose(0, 1), ys
+    ).transpose(0, 1)
+    assert actual.shape == (b, h, d)
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.01)

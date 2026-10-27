@@ -2,6 +2,7 @@ import gc
 import json
 import os
 import statistics
+from pathlib import Path
 
 import torch
 
@@ -50,15 +51,35 @@ def main():
         if os.environ.get("BMM_INT8_ONLY") == "1"
         else (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2)
     )
+    if os.environ.get("BMM_EINSUM_SHAPES") == "1":
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "tests/data/bmm_w8a8_einsum_shapes.json"
+        )
+        records = json.loads(source.read_text())
+        # Source labels are b,h,d,r; BMM dimensions are batch=h, M=b, N=d, K=r.
+        shapes = [
+            (
+                row["shape"][1],
+                row["shape"][0],
+                row["shape"][2],
+                row["shape"][3],
+                row["count"],
+            )
+            for row in records
+        ]
+        shape_source = "fp8_einsum__int8_einsum"
+    else:
+        shapes = [
+            (1, 16384, 7168, 1024, 12),
+            (1, 16384, 2112, 7168, 5),
+            (1, 448, 7168, 256, 4),
+            (1, 14429, 7168, 1024, 4),
+            (1, 14429, 2112, 7168, 1),
+        ]
+        shape_source = "bmm_w8a8_fp8__int8"
     for dt in dtypes:
-        for m, n, k in [
-            (16384, 7168, 1024),
-            (16384, 2112, 7168),
-            (448, 7168, 256),
-            (14429, 7168, 1024),
-            (14429, 2112, 7168),
-        ]:
-            bs = 1
+        for bs, m, n, k, count in shapes:
             raw_a = torch.randn(bs, m, k, device="cuda", dtype=torch.bfloat16)
             raw_b = torch.randn(
                 bs, n, k, device="cuda", dtype=torch.bfloat16
@@ -102,7 +123,9 @@ def main():
                 dict(
                     dtype=str(dt),
                     shape=[bs, m, n, k],
-                    batch_assumed=True,
+                    batch_assumed=shape_source == "bmm_w8a8_fp8__int8",
+                    shape_source=shape_source,
+                    count=count,
                     candidate_us=us[0],
                     torch_channel_us=us[1],
                     raw_bf16_us=us[2],
