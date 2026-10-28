@@ -2833,7 +2833,7 @@ tensor into the caller-supplied `out` buffer.
   - stable: '5.0'
   cpp: '4.0'
 - id: bmm_w8a8
-  description: Channel-wise INT8 or FP8 batched matrix multiplication with per-row and per-column scales.
+  description: Channel-wise INT8 batched matrix multiplication with per-row and per-column scales.
   for:
   - bmm_w8a8
   labels:

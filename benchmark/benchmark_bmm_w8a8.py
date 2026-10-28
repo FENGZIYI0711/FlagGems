@@ -53,11 +53,7 @@ def main():
     torch.manual_seed(20261019)
     torch.backends.cuda.matmul.allow_tf32 = False
     rows = []
-    dtypes = (
-        (torch.int8,)
-        if os.environ.get("BMM_INT8_ONLY") == "1"
-        else (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2)
-    )
+    dtypes = (torch.int8,)
     if os.environ.get("BMM_EINSUM_SHAPES") == "1":
         source = (
             Path(__file__).resolve().parents[1]
@@ -91,18 +87,13 @@ def main():
             raw_b = torch.randn(
                 bs, n, k, device="cuda", dtype=torch.bfloat16
             ).transpose(1, 2)
-            limit = (
-                127
-                if dt == torch.int8
-                else (448 if dt == torch.float8_e4m3fn else 57344)
-            )
+            limit = 127
             sa = raw_a.float().abs().amax(2) / limit
             sb = raw_b.float().abs().amax(1) / limit
             aq = raw_a.float() / sa[:, :, None]
             bq = raw_b.float() / sb[:, None, :]
-            if dt == torch.int8:
-                aq = aq.round()
-                bq = bq.round()
+            aq = aq.round()
+            bq = bq.round()
             a = aq.to(dt)
             b = bq.transpose(1, 2).contiguous().to(dt).transpose(1, 2)
             ref = (

@@ -7,7 +7,6 @@ import torch
 import flag_gems
 
 
-@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "shape",
@@ -21,23 +20,13 @@ import flag_gems
 )
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.bmm_w8a8
-def test_bmm_w8a8(dtype, out_dtype, shape, transpose):
-    if (
-        dtype == torch.float8_e4m3fn
-        and flag_gems.vendor_name == "nvidia"
-        and torch.cuda.get_device_capability() < (8, 9)
-    ):
-        pytest.skip("Triton FP8 E4M3FN conversion requires NVIDIA SM89 or newer")
+def test_bmm_w8a8(out_dtype, shape, transpose):
     torch.manual_seed(20261019)
     batch, m, n, k = shape
     device = flag_gems.device
     b_shape = (batch, n, k) if transpose else (batch, k, n)
-    if dtype == torch.int8:
-        a = torch.randint(-128, 128, (batch, m, k), device=device, dtype=dtype)
-        b = torch.randint(-128, 128, b_shape, device=device, dtype=dtype)
-    else:
-        a = (torch.randn(batch, m, k, device=device) * 3).to(dtype)
-        b = (torch.randn(b_shape, device=device) * 3).to(dtype)
+    a = torch.randint(-128, 128, (batch, m, k), device=device, dtype=torch.int8)
+    b = torch.randint(-128, 128, b_shape, device=device, dtype=torch.int8)
     if transpose:
         b = b.transpose(1, 2)
     sa = (torch.rand(batch, m * 2, device=device) * 0.005)[:, ::2]
@@ -130,21 +119,14 @@ EINSUM_SHAPES = [
 
 @pytest.mark.bmm_w8a8
 @pytest.mark.parametrize("shape", EINSUM_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.float8_e5m2])
-def test_bmm_w8a8_einsum_shapes(shape, dtype, monkeypatch):
-    if (
-        dtype == torch.float8_e4m3fn
-        and flag_gems.vendor_name == "nvidia"
-        and torch.cuda.get_device_capability() < (8, 9)
-    ):
-        pytest.skip("Triton FP8 E4M3FN conversion requires NVIDIA SM89 or newer")
+def test_bmm_w8a8_einsum_shapes(shape, monkeypatch):
     torch.manual_seed(20261027)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     b, h, d, r = shape
     device = flag_gems.device
     # bhr,hdr->bhd becomes (h,b,r) @ (h,r,d), followed by a view transpose.
-    x = (torch.randn(b, h, r, device=device) * 3).to(dtype)
-    y = (torch.randn(h, d, r, device=device) * 3).to(dtype)
+    x = (torch.randn(b, h, r, device=device) * 3).to(torch.int8)
+    y = (torch.randn(h, d, r, device=device) * 3).to(torch.int8)
     xs = torch.rand(b, h, device=device) * 0.01
     ys = torch.rand(h, d, device=device) * 0.01
     expected = (
@@ -162,24 +144,21 @@ def test_bmm_w8a8_einsum_shapes(shape, dtype, monkeypatch):
 @pytest.mark.skipif(flag_gems.vendor_name != "metax", reason="MetaX graph fast paths")
 @pytest.mark.bmm_w8a8
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 64, 128, 256, 512])
-@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.float8_e5m2])
-def test_bmm_w8a8_einsum_graph_full_range(m, dtype):
+def test_bmm_w8a8_einsum_graph_full_range(m):
     torch.manual_seed(20261027)
     n, k = 1024, 4096
     device = flag_gems.device
-    if dtype == torch.int8:
-        codes = torch.arange(-128, 128, dtype=torch.int16).to(torch.int8)
-    else:
-        codes = torch.arange(256, dtype=torch.int16).to(torch.uint8)
-        codes = codes[torch.isfinite(codes.view(dtype).float())]
+    codes = torch.arange(-128, 128, dtype=torch.int16).to(torch.int8)
     codes = codes.to(device)
 
     def sample(shape):
-        return codes[torch.randint(codes.numel(), shape, device=device)].view(dtype)
+        return codes[torch.randint(codes.numel(), shape, device=device)].view(
+            torch.int8
+        )
 
     a = sample((1, m, k))
     b = sample((1, n, k)).transpose(1, 2)
-    scale_limit = 1e-6 if dtype == torch.float8_e5m2 else 1e-3
+    scale_limit = 1e-3
     sa = torch.rand(1, m, device=device) * scale_limit
     sb = torch.rand(1, n, device=device) * scale_limit
     out = torch.empty((1, m, n), device=device, dtype=torch.bfloat16)
@@ -204,3 +183,18 @@ def test_bmm_w8a8_einsum_graph_full_range(m, dtype):
             torch.bmm(a.double(), b.double()) * sa[:, :, None] * sb[:, None, :]
         ).bfloat16()
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=0.01)
+
+
+@pytest.mark.bmm_w8a8
+@pytest.mark.parametrize("operand", ["a", "b"])
+def test_bmm_w8a8_rejects_non_int8(operand):
+    a = torch.zeros((1, 2, 32), device=flag_gems.device, dtype=torch.int8)
+    b = torch.zeros((1, 32, 16), device=flag_gems.device, dtype=torch.int8)
+    sa = torch.ones((1, 2), device=flag_gems.device)
+    sb = torch.ones((1, 16), device=flag_gems.device)
+    if operand == "a":
+        a = a.float()
+    else:
+        b = b.float()
+    with pytest.raises(TypeError, match="INT8"):
+        flag_gems.bmm_w8a8(a, b, sa, sb)
