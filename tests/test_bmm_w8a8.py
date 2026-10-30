@@ -1,6 +1,3 @@
-import json
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -110,9 +107,68 @@ def test_bmm_w8a8_graph_replay():
 # FlagOSTune f4f65a7d779a0df3b017e9a80b75a7b9d651c639, DeepSeek-V4-Flash.
 # Reuse contraction dimensions, with channel-wise rather than block-wise scales.
 EINSUM_SHAPES = [
-    tuple(row["shape"])
-    for row in json.loads(
-        (Path(__file__).parent / "data/bmm_w8a8_einsum_shapes.json").read_text()
+    (m, 1, 1024, 4096)
+    for m in (
+        16384,
+        496,
+        512,
+        1,
+        104,
+        112,
+        120,
+        128,
+        136,
+        144,
+        152,
+        16,
+        160,
+        168,
+        176,
+        184,
+        192,
+        2,
+        200,
+        208,
+        216,
+        224,
+        232,
+        24,
+        240,
+        248,
+        256,
+        272,
+        288,
+        304,
+        32,
+        320,
+        336,
+        352,
+        368,
+        384,
+        4,
+        40,
+        400,
+        416,
+        432,
+        448,
+        464,
+        48,
+        480,
+        56,
+        64,
+        72,
+        8,
+        80,
+        88,
+        96,
+        2048,
+        4100,
+        13021,
+        1028,
+        3805,
+        3076,
+        12991,
+        13005,
     )
 ]
 

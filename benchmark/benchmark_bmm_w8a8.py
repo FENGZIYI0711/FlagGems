@@ -2,7 +2,6 @@ import gc
 import json
 import os
 import statistics
-from pathlib import Path
 
 import torch
 
@@ -55,22 +54,71 @@ def main():
     rows = []
     dtypes = (torch.int8,)
     if os.environ.get("BMM_EINSUM_SHAPES") == "1":
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "tests/data/bmm_w8a8_einsum_shapes.json"
-        )
-        records = json.loads(source.read_text())
-        # Source labels are b,h,d,r; BMM dimensions are batch=h, M=b, N=d, K=r.
-        shapes = [
-            (
-                row["shape"][1],
-                row["shape"][0],
-                row["shape"][2],
-                row["shape"][3],
-                row["count"],
-            )
-            for row in records
+        # FlagOSTune f4f65a7d779a0df3b017e9a80b75a7b9d651c639, DeepSeek-V4-Flash.
+        # Preserve source order and invocation counts; batch=1, N=1024, K=4096.
+        m_counts = [
+            (16384, 4310),
+            (496, 1376),
+            (512, 1376),
+            (1, 688),
+            (104, 688),
+            (112, 688),
+            (120, 688),
+            (128, 688),
+            (136, 688),
+            (144, 688),
+            (152, 688),
+            (16, 688),
+            (160, 688),
+            (168, 688),
+            (176, 688),
+            (184, 688),
+            (192, 688),
+            (2, 688),
+            (200, 688),
+            (208, 688),
+            (216, 688),
+            (224, 688),
+            (232, 688),
+            (24, 688),
+            (240, 688),
+            (248, 688),
+            (256, 688),
+            (272, 688),
+            (288, 688),
+            (304, 688),
+            (32, 688),
+            (320, 688),
+            (336, 688),
+            (352, 688),
+            (368, 688),
+            (384, 688),
+            (4, 688),
+            (40, 688),
+            (400, 688),
+            (416, 688),
+            (432, 688),
+            (448, 688),
+            (464, 688),
+            (48, 688),
+            (480, 688),
+            (56, 688),
+            (64, 688),
+            (72, 688),
+            (8, 688),
+            (80, 688),
+            (88, 688),
+            (96, 688),
+            (2048, 172),
+            (4100, 172),
+            (13021, 129),
+            (1028, 43),
+            (3805, 43),
+            (3076, 43),
+            (12991, 43),
+            (13005, 43),
         ]
+        shapes = [(1, m, 1024, 4096, count) for m, count in m_counts]
         shape_source = "fp8_einsum__int8_einsum"
     else:
         shapes = [
